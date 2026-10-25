@@ -1,0 +1,5 @@
+export const API=import.meta.env.VITE_API_URL??"http://localhost:4000/api";
+export type Session={token:string;user:{id:string;email:string;name:string};workspaces:any[]};
+export function readSession():Session|null{try{return JSON.parse(localStorage.getItem("support-session")??"null")}catch{return null}}
+export function saveSession(s:Session|null){s?localStorage.setItem("support-session",JSON.stringify(s)):localStorage.removeItem("support-session")}
+export async function call<T=any>(path:string,session:Session,workspaceId?:string,init:RequestInit={}):Promise<T>{const headers=new Headers(init.headers);headers.set("Authorization",`Bearer ${session.token}`);if(workspaceId)headers.set("X-Workspace-Id",workspaceId);if(init.body&&!headers.has("Content-Type")&&!(init.body instanceof FormData))headers.set("Content-Type","application/json");const response=await fetch(`${API}${path}`,{...init,headers});if(!response.ok){const body=await response.json().catch(()=>({}));throw new Error(body.error??`Request failed (${response.status})`)}return response.status===204?undefined as T:response.json()}
