@@ -1,4 +1,4 @@
-﻿import "express-async-errors";
+import "express-async-errors";
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
@@ -43,7 +43,7 @@ app.post("/api/auth/register", async (req,res,next)=>{
   try {
     const data=z.object({name:z.string().min(1).max(100),email:z.string().email(),password:z.string().min(8)}).parse(req.body);
     const user=(await query<{id:string;email:string;name:string}>("INSERT INTO users(name,email,password_hash) VALUES($1,lower($2),$3) RETURNING id,email,name",[data.name,data.email,await bcrypt.hash(data.password,12)])).rows[0];
-    const ws=(await query<{id:string;name:string;public_key:string}>("INSERT INTO workspaces(name) VALUES($1) RETURNING id,name,public_key",[`${data.name}'s workspace"])).rows[0];
+    const ws=(await query<{id:string;name:string;public_key:string}>("INSERT INTO workspaces(name) VALUES($1) RETURNING id,name,public_key",[`${data.name}'s workspace`])).rows[0];
     await query("INSERT INTO memberships(workspace_id,user_id,role) VALUES($1,$2,'owner')",[ws.id,user.id]);
     res.status(201).json({token:tokenFor(user),user,workspaces:[ws]});
   } catch(e){ next(e); }
@@ -121,6 +121,7 @@ app.post("/api/widget/:key/conversations/:id/messages",async(req,res,next)=>{
   await query("INSERT INTO messages(conversation_id,sender,content) VALUES($1,'customer',$2)",[req.params.id,d.content]);await query("UPDATE conversations SET status='open' WHERE id=$1 AND status='closed'",[req.params.id]);
   const vector=(await embed([d.content],"query"))[0];const vec=`[${vector.join(",")}]`;
   const matches=(await query<any>("SELECT x.source_id,x.title,x.content,x.url,x.page,x.score FROM (SELECT s.id source_id,s.title,s.url,c.page,c.content,1-(c.embedding <=> $2::vector) score,ts_rank(c.search_vector,websearch_to_tsquery('simple',$3)) fts FROM source_chunks c JOIN sources s ON s.id=c.source_id WHERE c.workspace_id=$1 AND s.status='ready') x ORDER BY (x.score*0.75 + least(x.fts,1)*0.25) DESC LIMIT 5",[w.id,vec,d.content])).rows;
+
   const wantsStream=(req.get("accept")??"").includes("text/event-stream");
   const fallback="I am not confident I can answer that from this business's help information. I have sent it to the support team so they can help.";
   let answer=fallback;let language=/[\u0900-\u097f]/.test(d.content)?"hi":"en";let handoff=matches.length===0||Number(matches[0].score)<0.23;let citations:any[]=[];let partial="";
