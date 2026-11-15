@@ -5,6 +5,7 @@ import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
 import { load } from "cheerio";
 import { query, pool } from "./db.js";
+import { recordMlCall } from "./metrics.js";
 const require = createRequire(import.meta.url);
 const pdfParse = require("pdf-parse");
 const uploadRoot = path.resolve(process.env.UPLOAD_DIR ?? "./data/uploads");
@@ -55,9 +56,10 @@ export function chunkText(text: string, size = 900, overlap = 120): string[] {
   return chunks.filter(Boolean);
 }
 export async function embed(texts: string[], inputType: "query" | "passage" = "passage"): Promise<number[][]> {
-  const res = await fetch(`${process.env.ML_SERVICE_URL ?? "http://localhost:8000"}/embed`, { method: "POST", headers: { "content-type": "application/json", ...(process.env.ML_API_KEY ? { "x-ml-api-key": process.env.ML_API_KEY } : {}) }, body: JSON.stringify({ texts, input_type: inputType }), signal: AbortSignal.timeout(120000) });
-  if (!res.ok) throw new Error(`Embedding service error: ${await res.text()}`);
-  return (await res.json() as { embeddings: number[][] }).embeddings;
+  const started=Date.now();let failed=true;
+  try{const res = await fetch(`${process.env.ML_SERVICE_URL ?? "http://localhost:8000"}/embed`, { method: "POST", headers: { "content-type": "application/json", ...(process.env.ML_API_KEY ? { "x-ml-api-key": process.env.ML_API_KEY } : {}) }, body: JSON.stringify({ texts, input_type: inputType }), signal: AbortSignal.timeout(120000) });
+    if (!res.ok) throw new Error(`Embedding service error: ${await res.text()}`);failed=false;return (await res.json() as { embeddings: number[][] }).embeddings;
+  }finally{recordMlCall(started,failed);}
 }
 export async function indexSource(sourceId: string, workspaceId: string, text: string) {
   await query("UPDATE sources SET status='processing', error=NULL, updated_at=now() WHERE id=$1 AND workspace_id=$2", [sourceId, workspaceId]);

@@ -12,6 +12,7 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import fs from "node:fs/promises";
 import { query, pool } from "./db.js";
 import { embed, extractFile, indexSource, readUrl, storage } from "./services.js";
+import { metrics, trackedMlFetch } from "./metrics.js";
 const app = express(); const port = Number(process.env.API_PORT ?? 4000);
 const jwtSecret: string = process.env.JWT_SECRET ?? "";
 if (!jwtSecret || jwtSecret.length < 32) throw new Error("JWT_SECRET must be set to at least 32 characters");
@@ -22,6 +23,7 @@ app.use((req, res, next) => {
   cors({ origin: (origin, callback) => callback(null, widgetCors || !origin || allowedOrigins.includes(origin)), credentials: !widgetCors })(req, res, next);
 });
 app.use(express.json({ limit: "2mb" }));
+app.use((req,res,next)=>{const started=Date.now();res.on("finish",()=>{metrics.requests++;if(res.statusCode>=500)metrics.failedRequests++;console.log(JSON.stringify({event:"http_request",method:req.method,path:req.path,status:res.statusCode,durationMs:Date.now()-started}));});next();});
 app.use("/api/auth", rateLimit({ windowMs: 15 * 60_000, limit: 20, standardHeaders: true, legacyHeaders: false }));
 app.use("/api/widget", rateLimit({ windowMs: 60_000, limit: 30, standardHeaders: true, legacyHeaders: false }));
 const uploadDir = path.resolve(process.env.UPLOAD_DIR ?? "./data/uploads");
@@ -45,10 +47,11 @@ async function workspace(req: AuthReq, res: express.Response, next: express.Next
 function requireRole(...roles: string[]) { return (req: AuthReq, res: express.Response, next: express.NextFunction) => roles.includes((req as any).role) ? next() : res.status(403).json({error:"Insufficient workspace role"}); }
 function errorHandler(err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) {
   if(err instanceof z.ZodError)return res.status(400).json({error:"Validation failed",issues:err.issues});
-  console.error(err); res.status(500).json({ error: "Unexpected server error" });
+  console.error(JSON.stringify({event:"api_error",name:err?.name??"Error",message:err?.message??"Unexpected error"})); res.status(500).json({ error: "Unexpected server error" });
 }
 app.get("/health", (_req,res)=>res.json({ok:true,service:"api"}));
-app.get("/ready", async (_req,res)=>{try{await pool.query("SELECT 1");res.json({ok:true,service:"api",database:true});}catch{res.status(503).json({ok:false,service:"api",database:false});}});
+app.get("/ready", async (_req,res)=>{const db=await pool.query("SELECT 1").then(()=>true,()=>false);const ml=await fetch(`${process.env.ML_SERVICE_URL??"http://localhost:8000"}/health`,{signal:AbortSignal.timeout(2500)}).then(r=>r.ok,()=>false);const ok=db&&ml;res.status(ok?200:503).json({ok,service:"api",database:db,ml});});
+app.get("/metrics",(req,res)=>{const expected=process.env.METRICS_TOKEN;if(!expected||req.header("authorization")!==`Bearer ${expected}`)return res.status(404).end();res.json({...metrics,mlAverageLatencyMs:metrics.mlRequests?Math.round(metrics.mlLatencyMs/metrics.mlRequests):0});});
 app.post("/api/auth/logout",auth,async(req:AuthReq,res)=>{const token=cookie(req,"support_session");if(token)await query("DELETE FROM user_sessions WHERE token_hash=$1",[hash(token)]);res.clearCookie("support_session",{httpOnly:true,sameSite:"lax",secure:process.env.NODE_ENV==="production",path:"/"});res.status(204).end();});
 
 app.post("/api/auth/register", async (req,res,next)=>{
@@ -151,16 +154,16 @@ app.post("/api/widget/:key/conversations/:id/messages",async(req,res,next)=>{
    const mlUrl=process.env.ML_SERVICE_URL??"http://localhost:8000";const body=JSON.stringify({question:d.content,language,context,model:process.env.OLLAMA_CHAT_MODEL??"qwen2.5:1.5b"});
    if(wantsStream){
     const mlHeaders={"content-type":"application/json",...(process.env.ML_API_KEY?{"x-ml-api-key":process.env.ML_API_KEY}:{})};
-    const mr=await fetch(`${mlUrl}/generate-stream`,{method:"POST",headers:mlHeaders,body,signal:AbortSignal.timeout(180000)});if(!mr.ok)throw new Error("Model service unavailable");
+    const mr=await trackedMlFetch(`${mlUrl}/generate-stream`,{method:"POST",headers:mlHeaders,body,signal:AbortSignal.timeout(180000)});if(!mr.ok)throw new Error("Model service unavailable");
     const reader=mr.body!.getReader();const decoder=new TextDecoder();let buffer="";let early="";let shouldStream=true;
     while(true){const {done,value}=await reader.read();if(done)break;buffer+=decoder.decode(value,{stream:true});const lines=buffer.split("\n");buffer=lines.pop()??"";for(const line of lines){if(!line.startsWith("data: "))continue;const event=JSON.parse(line.slice(6));if(event.error)throw new Error(event.error);if(event.token){partial+=event.token;if(shouldStream){early+=event.token;if(early.length>=9){emit({type:"delta",token:early});early="";}if(/^\s*(handoff|escalate)/i.test(partial))shouldStream=false;else if(early.length) {emit({type:"delta",token:early});early="";}}}}}
-   }else{const mr=await fetch(`${mlUrl}/generate`,{method:"POST",headers:{"content-type":"application/json",...(process.env.ML_API_KEY?{"x-ml-api-key":process.env.ML_API_KEY}:{})},body,signal:AbortSignal.timeout(180000)});if(!mr.ok)throw new Error("Model service unavailable");partial=(await mr.json() as {answer:string}).answer;}
+   }else{const mr=await trackedMlFetch(`${mlUrl}/generate`,{method:"POST",headers:{"content-type":"application/json",...(process.env.ML_API_KEY?{"x-ml-api-key":process.env.ML_API_KEY}:{})},body,signal:AbortSignal.timeout(180000)});if(!mr.ok)throw new Error("Model service unavailable");partial=(await mr.json() as {answer:string}).answer;}
    const generated=partial.trim();const nums=[...generated.matchAll(/\[(\d+)\]/g)].map(x=>Number(x[1]));const clean=generated.replace(/\s*\[\d+\]/g,"").trim();
    for(const n of [...new Set(nums)]){const m=matches[n-1];if(m)citations.push({sourceId:m.source_id,title:m.title,excerpt:m.content.slice(0,280),url:m.url??undefined,page:m.page??undefined});}
    if(/^\s*(handoff|escalate)\b/i.test(clean)||!clean||!citations.length){handoff=true;}
    else answer=clean;
   }
-  if(handoff){answer=language==="hi"?"मुझे उपलब्ध सहायता जानकारी में इसका भरोसेमंद उत्तर नहीं मिला। मैंने आपका संदेश सहायता टीम को भेज दिया है।":fallback;citations=[];}
+  if(handoff){metrics.handoffs++;answer=language==="hi"?"मुझे उपलब्ध सहायता जानकारी में इसका भरोसेमंद उत्तर नहीं मिला। मैंने आपका संदेश सहायता टीम को भेज दिया है।":fallback;citations=[];}
   const m=(await query("INSERT INTO messages(conversation_id,sender,content,language,citations,handoff) VALUES($1,'assistant',$2,$3,$4::jsonb,$5) RETURNING id,sender,content,language,citations,handoff,created_at",[req.params.id,answer,language,JSON.stringify(citations),handoff])).rows[0];
   await query("UPDATE conversations SET status=CASE WHEN $2 THEN 'escalated' ELSE status END,updated_at=now() WHERE id=$1",[req.params.id,handoff]);
   if(wantsStream){emit({type:"final",message:m});res.write("data: {\"type\":\"done\"}\n\n");res.end();}else res.status(201).json(m);
@@ -179,7 +182,7 @@ async function seed(){
  if(email&&password){const existing=await query<any>("SELECT id FROM users WHERE email=lower($1)",[email]);if(!existing.rowCount){const u=(await query<any>("INSERT INTO users(name,email,password_hash) VALUES('Demo Admin',lower($1),$2) RETURNING id",[email,await bcrypt.hash(password,12)])).rows[0];const w=(await query<any>("INSERT INTO workspaces(name,allowed_domains) VALUES('Acme Demo Support',ARRAY['localhost']) RETURNING id",[])).rows[0];await query("INSERT INTO memberships(workspace_id,user_id,role) VALUES($1,$2,'owner')",[w.id,u.id]);const faq=(await query<any>("INSERT INTO sources(workspace_id,title,kind,status) VALUES($1,'Getting started','faq','ready') RETURNING id",[w.id])).rows[0];const text="Question: How do I reset my password? Answer: Select Forgot password on the sign-in screen, enter your account email, and follow the secure reset link sent to your inbox. The link expires after 30 minutes.\n\nQuestion: How can I contact support? Answer: Ask a question through this support chat. If the assistant cannot find a reliable answer, it will pass your conversation to a support agent.";const chunks=text.match(/.{1,900}/gs)??[text];const vectors=await embed(chunks);for(let i=0;i<chunks.length;i++)await query("INSERT INTO source_chunks(workspace_id,source_id,chunk_index,content,embedding) VALUES($1,$2,$3,$4,$5::vector)",[w.id,faq.id,i,chunks[i],`[${vectors[i].join(",")}]`]);}}
 }
 let processingJob=false;
-async function processNextSource(){if(processingJob)return;processingJob=true;try{const job=(await query<any>("WITH candidate AS (SELECT id FROM sources WHERE status='queued' ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE sources s SET status='processing',error=NULL,updated_at=now() FROM candidate c WHERE s.id=c.id RETURNING s.id,s.workspace_id,s.kind,s.url,s.original_name,s.storage_path,s.raw_content")).rows[0];if(!job)return;try{let content=job.raw_content??"";if(job.kind==="url"){const page=await readUrl(job.url);content=page.text;await query("UPDATE sources SET title=$2 WHERE id=$1",[job.id,page.title]);}if(job.kind==="file")content=await extractFile(job.storage_path,job.original_name);await indexSource(job.id,job.workspace_id,content);}catch(error){console.error(JSON.stringify({event:"source_ingestion_failed",sourceId:job.id,workspaceId:job.workspace_id,error:String(error)}));await query("UPDATE sources SET status='error',error='Ingestion failed. Retry or replace this source.',updated_at=now() WHERE id=$1",[job.id]).catch(()=>{});}}catch(error){console.error(JSON.stringify({event:"source_queue_failed",error:String(error)}));}finally{processingJob=false;}}
+async function processNextSource(){if(processingJob)return;processingJob=true;try{const job=(await query<any>("WITH candidate AS (SELECT id FROM sources WHERE status='queued' ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE sources s SET status='processing',error=NULL,updated_at=now() FROM candidate c WHERE s.id=c.id RETURNING s.id,s.workspace_id,s.kind,s.url,s.original_name,s.storage_path,s.raw_content")).rows[0];if(!job)return;metrics.sourceJobs++;try{let content=job.raw_content??"";if(job.kind==="url"){const page=await readUrl(job.url);content=page.text;await query("UPDATE sources SET title=$2 WHERE id=$1",[job.id,page.title]);}if(job.kind==="file")content=await extractFile(job.storage_path,job.original_name);await indexSource(job.id,job.workspace_id,content);}catch(error){metrics.sourceJobFailures++;console.error(JSON.stringify({event:"source_ingestion_failed",sourceId:job.id,workspaceId:job.workspace_id,error:String(error)}));await query("UPDATE sources SET status='error',error='Ingestion failed. Retry or replace this source.',updated_at=now() WHERE id=$1",[job.id]).catch(()=>{});}}catch(error){console.error(JSON.stringify({event:"source_queue_failed",error:String(error)}));}finally{processingJob=false;}}
 const server=seed().then(()=>app.listen(port,()=>console.log(`API listening on port ${port}`))).catch(e=>{console.error("Startup failed",e);process.exit(1);});
 const worker=setInterval(()=>void processNextSource(),1000);
 process.on("SIGTERM",async()=>{clearInterval(worker);(await server).close(async()=>{await pool.end();process.exit(0);});});

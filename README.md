@@ -21,3 +21,5 @@ The app does not require a fine-tuned adapter. `python evaluate.py` runs the sma
 ## Security notes
 
 Workspace-scoped authorization is enforced in API queries. The ML service limits concurrent work and request sizes; `ML_API_KEY` enables API-to-ML authentication. Keep ML and Ollama on private networks, configure HTTPS, durable object storage, backups, and production identity controls before exposing this development MVP publicly. The widget domain allowlist is a browser embedding restriction, not visitor authentication.
+
+The API readiness endpoint checks PostgreSQL and the ML health endpoint. Structured request logs and aggregate operational counters are available at `/metrics` when `METRICS_TOKEN` is configured; scrape it with `Authorization: Bearer <token>` and keep the endpoint on a private network.
