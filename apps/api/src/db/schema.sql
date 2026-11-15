@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS memberships (
 CREATE TABLE IF NOT EXISTS sources (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(), workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
   title TEXT NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('file','url','faq')),
-  original_name TEXT, url TEXT, storage_path TEXT, status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued','processing','ready','error')),
+  original_name TEXT, url TEXT, storage_path TEXT, raw_content TEXT, status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued','processing','ready','error')),
   error TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS source_chunks (
