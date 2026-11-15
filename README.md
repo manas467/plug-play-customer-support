@@ -18,7 +18,7 @@ The app works without a GPU. On an 8 GB machine, small quantized Ollama models m
 
 The app does not require a fine-tuned adapter. `python evaluate.py` runs the small held-out generation benchmark and reports expected-content, citation/abstention, script, and handoff rates. It requires a running ML service and Ollama. Treat this as a smoke benchmark, then add representative, reviewed cases and labeled relevant passages before changing retrieval thresholds or the vector/text blend. Never put tenant-uploaded/private content in evaluation or training data.
 
-Run `python evaluate_retrieval.py` from `services/ml` to compare vector weights on the synthetic English/Hindi labeled retrieval set. It reports Recall@K, MRR, and nDCG@K. This offline benchmark uses token overlap as a lightweight lexical proxy; production combines pgvector similarity with PostgreSQL `ts_rank`, so validate promising weights against a labeled staging corpus before deployment. Never include private tenant data.
+Run `python evaluate_retrieval.py` from `services/ml` to compare vector weights on the synthetic English/Hindi labeled retrieval set. It reports Recall@K, MRR, and nDCG@K. Run `python evaluate_answers.py` to measure answer content, citation selection, language script, and abstention, including prompt injection and wrong-source citation cases. These are small smoke datasets; the retrieval benchmark uses token overlap as a proxy for PostgreSQL `ts_rank`. Validate thresholds against a larger reviewed staging corpus before deployment. Never include private tenant data.
 
 ## Security notes
 
