@@ -45,7 +45,7 @@ export function chunkText(text: string, size = 900, overlap = 120): string[] {
   return chunks.filter(Boolean);
 }
 export async function embed(texts: string[], inputType: "query" | "passage" = "passage"): Promise<number[][]> {
-  const res = await fetch(`${process.env.ML_SERVICE_URL ?? "http://localhost:8000"}/embed`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ texts, input_type: inputType }), signal: AbortSignal.timeout(120000) });
+  const res = await fetch(`${process.env.ML_SERVICE_URL ?? "http://localhost:8000"}/embed`, { method: "POST", headers: { "content-type": "application/json", ...(process.env.ML_API_KEY ? { "x-ml-api-key": process.env.ML_API_KEY } : {}) }, body: JSON.stringify({ texts, input_type: inputType }), signal: AbortSignal.timeout(120000) });
   if (!res.ok) throw new Error(`Embedding service error: ${await res.text()}`);
   return (await res.json() as { embeddings: number[][] }).embeddings;
 }

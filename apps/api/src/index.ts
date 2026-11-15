@@ -12,9 +12,12 @@ import fs from "node:fs/promises";
 import { query, pool } from "./db.js";
 import { embed, extractFile, indexSource, readUrl, storage } from "./services.js";
 const app = express(); const port = Number(process.env.API_PORT ?? 4000);
-const jwtSecret = process.env.JWT_SECRET ?? "local-only-change-this-secret-before-deploy";
+const jwtSecret = process.env.JWT_SECRET;
+if (!jwtSecret || jwtSecret.length < 32) throw new Error("JWT_SECRET must be set to at least 32 characters");
 app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
-app.use(cors({ origin: true, credentials: false })); app.use(express.json({ limit: "2mb" }));
+const allowedOrigins = (process.env.WEB_ORIGIN ?? "http://localhost:5173").split(",").map(x => x.trim()).filter(Boolean);
+app.use(cors({ origin: (origin, callback) => callback(null, !origin || allowedOrigins.includes(origin)), credentials: false })); app.use(express.json({ limit: "2mb" }));
+app.use("/api/auth", rateLimit({ windowMs: 15 * 60_000, limit: 20, standardHeaders: true, legacyHeaders: false }));
 app.use("/api/widget", rateLimit({ windowMs: 60_000, limit: 30, standardHeaders: true, legacyHeaders: false }));
 const uploadDir = path.resolve(process.env.UPLOAD_DIR ?? "./data/uploads");
 const upload = multer({ dest: path.join(uploadDir, "tmp"), limits: { fileSize: 15 * 1024 * 1024 } });
@@ -35,7 +38,7 @@ async function workspace(req: AuthReq, res: express.Response, next: express.Next
 function requireRole(...roles: string[]) { return (req: AuthReq, res: express.Response, next: express.NextFunction) => roles.includes((req as any).role) ? next() : res.status(403).json({error:"Insufficient workspace role"}); }
 function errorHandler(err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) {
   if(err instanceof z.ZodError)return res.status(400).json({error:"Validation failed",issues:err.issues});
-  console.error(err); res.status(500).json({ error: err?.message ?? "Unexpected server error" });
+  console.error(err); res.status(500).json({ error: "Unexpected server error" });
 }
 app.get("/health", (_req,res)=>res.json({ok:true,service:"api"}));
 
@@ -131,10 +134,11 @@ app.post("/api/widget/:key/conversations/:id/messages",async(req,res,next)=>{
    const context=matches.map((m:any,i:number)=>`[${i+1}] ${m.title}${m.page?` (page ${m.page})`:""}\n${m.content}`).join("\n\n");
    const mlUrl=process.env.ML_SERVICE_URL??"http://localhost:8000";const body=JSON.stringify({question:d.content,language,context,model:process.env.OLLAMA_CHAT_MODEL??"qwen2.5:1.5b"});
    if(wantsStream){
-    const mr=await fetch(`${mlUrl}/generate-stream`,{method:"POST",headers:{"content-type":"application/json"},body,signal:AbortSignal.timeout(180000)});if(!mr.ok)throw new Error(`Model service error: ${await mr.text()}`);
+    const mlHeaders={"content-type":"application/json",...(process.env.ML_API_KEY?{"x-ml-api-key":process.env.ML_API_KEY}:{})};
+    const mr=await fetch(`${mlUrl}/generate-stream`,{method:"POST",headers:mlHeaders,body,signal:AbortSignal.timeout(180000)});if(!mr.ok)throw new Error("Model service unavailable");
     const reader=mr.body!.getReader();const decoder=new TextDecoder();let buffer="";let early="";let shouldStream=true;
     while(true){const {done,value}=await reader.read();if(done)break;buffer+=decoder.decode(value,{stream:true});const lines=buffer.split("\n");buffer=lines.pop()??"";for(const line of lines){if(!line.startsWith("data: "))continue;const event=JSON.parse(line.slice(6));if(event.error)throw new Error(event.error);if(event.token){partial+=event.token;if(shouldStream){early+=event.token;if(early.length>=9){emit({type:"delta",token:early});early="";}if(/^\s*(handoff|escalate)/i.test(partial))shouldStream=false;else if(early.length) {emit({type:"delta",token:early});early="";}}}}}
-   }else{const mr=await fetch(`${mlUrl}/generate`,{method:"POST",headers:{"content-type":"application/json"},body,signal:AbortSignal.timeout(180000)});if(!mr.ok)throw new Error(`Model service error: ${await mr.text()}`);partial=(await mr.json() as {answer:string}).answer;}
+   }else{const mr=await fetch(`${mlUrl}/generate`,{method:"POST",headers:{"content-type":"application/json",...(process.env.ML_API_KEY?{"x-ml-api-key":process.env.ML_API_KEY}:{})},body,signal:AbortSignal.timeout(180000)});if(!mr.ok)throw new Error("Model service unavailable");partial=(await mr.json() as {answer:string}).answer;}
    const generated=partial.trim();const nums=[...generated.matchAll(/\[(\d+)\]/g)].map(x=>Number(x[1]));const clean=generated.replace(/\s*\[\d+\]/g,"").trim();
    for(const n of [...new Set(nums)]){const m=matches[n-1];if(m)citations.push({sourceId:m.source_id,title:m.title,excerpt:m.content.slice(0,280),url:m.url??undefined,page:m.page??undefined});}
    if(/^\s*(handoff|escalate)\b/i.test(clean)||!clean||!citations.length){handoff=true;}
