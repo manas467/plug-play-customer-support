@@ -5,6 +5,11 @@ CREATE TABLE IF NOT EXISTS users (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(), email TEXT NOT NULL UNIQUE,
   password_hash TEXT NOT NULL, name TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS user_sessions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(), user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  token_hash TEXT NOT NULL UNIQUE, csrf_hash TEXT NOT NULL, expires_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 CREATE TABLE IF NOT EXISTS workspaces (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(), name TEXT NOT NULL,
   public_key TEXT NOT NULL UNIQUE DEFAULT ('w_' || encode(gen_random_bytes(18), 'hex')),

@@ -8,6 +8,7 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { z } from "zod";
 import path from "node:path";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import fs from "node:fs/promises";
 import { query, pool } from "./db.js";
 import { embed, extractFile, indexSource, readUrl, storage } from "./services.js";
@@ -18,7 +19,7 @@ app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
 const allowedOrigins = (process.env.WEB_ORIGIN ?? "http://localhost:5173").split(",").map(x => x.trim()).filter(Boolean);
 app.use((req, res, next) => {
   const widgetCors = req.path.startsWith("/api/widget/");
-  cors({ origin: (origin, callback) => callback(null, widgetCors || !origin || allowedOrigins.includes(origin)), credentials: false })(req, res, next);
+  cors({ origin: (origin, callback) => callback(null, widgetCors || !origin || allowedOrigins.includes(origin)), credentials: !widgetCors })(req, res, next);
 });
 app.use(express.json({ limit: "2mb" }));
 app.use("/api/auth", rateLimit({ windowMs: 15 * 60_000, limit: 20, standardHeaders: true, legacyHeaders: false }));
@@ -26,11 +27,13 @@ app.use("/api/widget", rateLimit({ windowMs: 60_000, limit: 30, standardHeaders:
 const uploadDir = path.resolve(process.env.UPLOAD_DIR ?? "./data/uploads");
 const upload = multer({ dest: path.join(uploadDir, "tmp"), limits: { fileSize: 15 * 1024 * 1024 } });
 type AuthReq = express.Request & { user?: { id: string; email: string } };
-function tokenFor(user: { id: string; email: string }) { return jwt.sign(user, jwtSecret, { expiresIn: "12h" }); }
-function auth(req: AuthReq, res: express.Response, next: express.NextFunction) {
-  const token = req.headers.authorization?.replace(/^Bearer\s+/i, "");
-  try { if (!token) throw new Error(); req.user = jwt.verify(token, jwtSecret) as { id: string; email: string }; next(); }
-  catch { res.status(401).json({ error: "Sign in required" }); }
+const hash=(value:string)=>createHash("sha256").update(value).digest("hex");
+function cookie(req:express.Request,name:string){return req.headers.cookie?.split(";").map(x=>x.trim()).find(x=>x.startsWith(`${name}=`))?.slice(name.length+1);}
+async function createSession(user:{id:string;email:string},res:express.Response){const token=randomBytes(32).toString("base64url"),csrf=randomBytes(32).toString("base64url");await query("INSERT INTO user_sessions(user_id,token_hash,csrf_hash,expires_at) VALUES($1,$2,$3,now()+interval '12 hours')",[user.id,hash(token),hash(csrf)]);res.cookie("support_session",token,{httpOnly:true,sameSite:"lax",secure:process.env.NODE_ENV==="production",path:"/",maxAge:12*60*60*1000});return csrf;}
+async function auth(req: AuthReq, res: express.Response, next: express.NextFunction) {
+  try { const token=cookie(req,"support_session");if(!token)throw new Error();const r=await query<any>("SELECT u.id,u.email,s.csrf_hash FROM user_sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=$1 AND s.expires_at>now()",[hash(token)]);if(!r.rowCount)throw new Error();req.user={id:r.rows[0].id,email:r.rows[0].email};(req as any).sessionCsrfHash=r.rows[0].csrf_hash;
+    if(!["GET","HEAD","OPTIONS"].includes(req.method)){const actual=req.header("x-csrf-token")??"";const a=Buffer.from(hash(actual)),b=Buffer.from(r.rows[0].csrf_hash);if(a.length!==b.length||!timingSafeEqual(a,b))return res.status(403).json({error:"CSRF validation failed"});}next();
+  } catch { res.status(401).json({ error: "Sign in required" }); }
 }
 async function workspace(req: AuthReq, res: express.Response, next: express.NextFunction) {
   const id = req.header("x-workspace-id");
@@ -46,6 +49,7 @@ function errorHandler(err: any, _req: express.Request, res: express.Response, _n
 }
 app.get("/health", (_req,res)=>res.json({ok:true,service:"api"}));
 app.get("/ready", async (_req,res)=>{try{await pool.query("SELECT 1");res.json({ok:true,service:"api",database:true});}catch{res.status(503).json({ok:false,service:"api",database:false});}});
+app.post("/api/auth/logout",auth,async(req:AuthReq,res)=>{const token=cookie(req,"support_session");if(token)await query("DELETE FROM user_sessions WHERE token_hash=$1",[hash(token)]);res.clearCookie("support_session",{httpOnly:true,sameSite:"lax",secure:process.env.NODE_ENV==="production",path:"/"});res.status(204).end();});
 
 app.post("/api/auth/register", async (req,res,next)=>{
   try {
@@ -53,7 +57,7 @@ app.post("/api/auth/register", async (req,res,next)=>{
     const user=(await query<{id:string;email:string;name:string}>("INSERT INTO users(name,email,password_hash) VALUES($1,lower($2),$3) RETURNING id,email,name",[data.name,data.email,await bcrypt.hash(data.password,12)])).rows[0];
     const ws=(await query<{id:string;name:string;public_key:string}>("INSERT INTO workspaces(name) VALUES($1) RETURNING id,name,public_key",[`${data.name}'s workspace`])).rows[0];
     await query("INSERT INTO memberships(workspace_id,user_id,role) VALUES($1,$2,'owner')",[ws.id,user.id]);
-    res.status(201).json({token:tokenFor(user),user,workspaces:[ws]});
+    const csrfToken=await createSession(user,res);res.status(201).json({csrfToken,user,workspaces:[ws]});
   } catch(e){ next(e); }
 });
 app.post("/api/auth/login", async(req,res,next)=>{
@@ -62,7 +66,7 @@ app.post("/api/auth/login", async(req,res,next)=>{
     if(!r.rowCount||!await bcrypt.compare(password,r.rows[0].password_hash)) return res.status(401).json({error:"Invalid email or password"});
     const user={id:r.rows[0].id,email:r.rows[0].email,name:r.rows[0].name};
     const workspaces=(await query("SELECT w.id,w.name,w.public_key,m.role FROM workspaces w JOIN memberships m ON m.workspace_id=w.id WHERE m.user_id=$1 ORDER BY w.created_at",[user.id])).rows;
-    res.json({token:tokenFor(user),user,workspaces});
+    const csrfToken=await createSession(user,res);res.json({csrfToken,user,workspaces});
   } catch(e){next(e);}
 });
 app.get("/api/me",auth,async(req:AuthReq,res)=>{
@@ -168,6 +172,7 @@ app.use(errorHandler);
 
 async function seed(){
  await pool.query("SELECT 1");
+ await pool.query("CREATE TABLE IF NOT EXISTS user_sessions(id UUID PRIMARY KEY DEFAULT gen_random_uuid(),user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,token_hash TEXT NOT NULL UNIQUE,csrf_hash TEXT NOT NULL,expires_at TIMESTAMPTZ NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT now())");
  await pool.query("ALTER TABLE sources ADD COLUMN IF NOT EXISTS raw_content TEXT");
  await pool.query("UPDATE sources SET status='queued',updated_at=now() WHERE status='processing' AND updated_at < now()-interval '10 minutes'");
  const email=process.env.DEMO_EMAIL;const password=process.env.DEMO_PASSWORD;
