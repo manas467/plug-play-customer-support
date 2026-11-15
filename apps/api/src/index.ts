@@ -12,11 +12,15 @@ import fs from "node:fs/promises";
 import { query, pool } from "./db.js";
 import { embed, extractFile, indexSource, readUrl, storage } from "./services.js";
 const app = express(); const port = Number(process.env.API_PORT ?? 4000);
-const jwtSecret = process.env.JWT_SECRET;
+const jwtSecret: string = process.env.JWT_SECRET ?? "";
 if (!jwtSecret || jwtSecret.length < 32) throw new Error("JWT_SECRET must be set to at least 32 characters");
 app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
 const allowedOrigins = (process.env.WEB_ORIGIN ?? "http://localhost:5173").split(",").map(x => x.trim()).filter(Boolean);
-app.use(cors({ origin: (origin, callback) => callback(null, !origin || allowedOrigins.includes(origin)), credentials: false })); app.use(express.json({ limit: "2mb" }));
+app.use((req, res, next) => {
+  const widgetCors = req.path.startsWith("/api/widget/");
+  cors({ origin: (origin, callback) => callback(null, widgetCors || !origin || allowedOrigins.includes(origin)), credentials: false })(req, res, next);
+});
+app.use(express.json({ limit: "2mb" }));
 app.use("/api/auth", rateLimit({ windowMs: 15 * 60_000, limit: 20, standardHeaders: true, legacyHeaders: false }));
 app.use("/api/widget", rateLimit({ windowMs: 60_000, limit: 30, standardHeaders: true, legacyHeaders: false }));
 const uploadDir = path.resolve(process.env.UPLOAD_DIR ?? "./data/uploads");
@@ -41,6 +45,7 @@ function errorHandler(err: any, _req: express.Request, res: express.Response, _n
   console.error(err); res.status(500).json({ error: "Unexpected server error" });
 }
 app.get("/health", (_req,res)=>res.json({ok:true,service:"api"}));
+app.get("/ready", async (_req,res)=>{try{await pool.query("SELECT 1");res.json({ok:true,service:"api",database:true});}catch{res.status(503).json({ok:false,service:"api",database:false});}});
 
 app.post("/api/auth/register", async (req,res,next)=>{
   try {
@@ -82,7 +87,7 @@ app.post("/api/workspaces/:id/members",auth,async(req:AuthReq,res,next)=>{
 });
 app.get("/api/workspaces/:id/members",auth,async(req:AuthReq,res)=>{const allowed=await query("SELECT 1 FROM memberships WHERE workspace_id=$1 AND user_id=$2",[req.params.id,req.user!.id]);if(!allowed.rowCount)return res.status(404).json({error:"Workspace not found"});res.json((await query("SELECT u.id,u.name,u.email,m.role FROM memberships m JOIN users u ON u.id=m.user_id WHERE m.workspace_id=$1 ORDER BY m.role,u.name",[req.params.id])).rows);});
 
-app.get("/api/sources",auth,workspace,async(req,res)=>res.json((await query("SELECT id,title,kind,original_name,url,status,error,created_at,updated_at,(SELECT count(*) FROM source_chunks c WHERE c.source_id=s.id) chunk_count FROM sources s WHERE workspace_id=$1 ORDER BY created_at DESC",[(req as any).workspaceId])).rows));
+app.get("/api/sources",auth,workspace,async(req,res)=>res.json((await query("SELECT id,title,kind,original_name,url,status,CASE WHEN status='error' THEN 'Indexing failed. Retry the source or replace it.' ELSE NULL END error,created_at,updated_at,(SELECT count(*) FROM source_chunks c WHERE c.source_id=s.id) chunk_count FROM sources s WHERE workspace_id=$1 ORDER BY created_at DESC LIMIT 500",[(req as any).workspaceId])).rows));
 app.post("/api/sources/faq",auth,workspace,requireRole("owner","admin"),async(req,res,next)=>{
  try {const d=z.object({question:z.string().min(3).max(2000),answer:z.string().min(2).max(8000),title:z.string().min(1).max(200).optional()}).parse(req.body); const ws=(req as any).workspaceId; const title=d.title??d.question.slice(0,100); const source=(await query("INSERT INTO sources(workspace_id,title,kind,status) VALUES($1,$2,'faq','processing') RETURNING id,title,kind,status",[ws,title])).rows[0]; await indexSource(source.id,ws,`Question: ${d.question}\nAnswer: ${d.answer}`); res.status(201).json({...source,status:"ready"}); }catch(e){next(e);}
 });
@@ -94,14 +99,19 @@ app.post("/api/sources/file",auth,workspace,requireRole("owner","admin"),upload.
  saved=await storage.save(ws,req.file); const source=(await query("INSERT INTO sources(workspace_id,title,kind,original_name,storage_path,status) VALUES($1,$2,'file',$3,$4,'processing') RETURNING id,title,kind,status",[ws,path.basename(req.file.originalname,ext),req.file.originalname,saved])).rows[0];sourceId=source.id; const text=await extractFile(saved,req.file.originalname); await indexSource(source.id,ws,text); res.status(201).json({...source,status:"ready"});
  }catch(e){if(sourceId)await query("UPDATE sources SET status='error',error=$2,updated_at=now() WHERE id=$1",[sourceId,String(e).slice(0,500)]).catch(()=>{});if(req.file)await fs.rm(req.file.path,{force:true}).catch(()=>{});next(e);}
 });
+app.post("/api/sources/:id/retry",auth,workspace,requireRole("owner","admin"),async(req,res,next)=>{try{const ws=(req as any).workspaceId;const src=(await query<any>("SELECT id,kind,url,original_name,storage_path FROM sources WHERE id=$1 AND workspace_id=$2",[req.params.id,ws])).rows[0];if(!src)return res.status(404).json({error:"Source not found"});let text="";if(src.kind==="url")text=(await readUrl(src.url)).text;else if(src.kind==="file")text=await extractFile(src.storage_path,src.original_name);else text=(await query<any>("SELECT string_agg(content,' ') text FROM source_chunks WHERE source_id=$1",[src.id])).rows[0]?.text??"";await indexSource(src.id,ws,text);res.json({id:src.id,status:"ready"});}catch(e){next(e);}});
 app.delete("/api/sources/:id",auth,workspace,requireRole("owner","admin"),async(req,res)=>{const source=await query<any>("DELETE FROM sources WHERE id=$1 AND workspace_id=$2 RETURNING storage_path",[req.params.id,(req as any).workspaceId]);if(source.rows[0]?.storage_path)await storage.remove(source.rows[0].storage_path);res.status(204).end();});
 
 app.get("/api/conversations",auth,workspace,async(req,res)=>{
- const status=typeof req.query.status==="string"?req.query.status:"all"; const result=await query("SELECT c.id,c.visitor_id,c.customer_name,c.customer_email,c.status,c.created_at,c.updated_at,(SELECT content FROM messages WHERE conversation_id=c.id ORDER BY created_at DESC LIMIT 1) last_message,(SELECT count(*) FROM messages WHERE conversation_id=c.id) message_count FROM conversations c WHERE workspace_id=$1 AND ($2='all' OR status=$2) ORDER BY updated_at DESC LIMIT 200",[(req as any).workspaceId,status]);res.json(result.rows);
+ const status=typeof req.query.status==="string"?req.query.status:"all";
+ const limit=Math.min(100,Math.max(1,Number(req.query.limit)||50));
+ const before=typeof req.query.before==="string"?req.query.before:null;
+ const result=await query("SELECT c.id,c.visitor_id,c.customer_name,c.customer_email,c.status,c.created_at,c.updated_at,(SELECT content FROM messages WHERE conversation_id=c.id ORDER BY created_at DESC LIMIT 1) last_message,(SELECT count(*) FROM messages WHERE conversation_id=c.id) message_count FROM conversations c WHERE workspace_id=$1 AND ($2='all' OR status=$2) AND ($3::timestamptz IS NULL OR updated_at < $3) ORDER BY updated_at DESC LIMIT $4",[(req as any).workspaceId,status,before,limit+1]);
+ const hasMore=result.rows.length>limit; const rows=result.rows.slice(0,limit);res.json({items:rows,hasMore,nextCursor:hasMore?rows[rows.length-1].updated_at:null});
 });
-app.get("/api/conversations/:id/messages",auth,workspace,async(req,res)=>{const owned=await query("SELECT id FROM conversations WHERE id=$1 AND workspace_id=$2",[req.params.id,(req as any).workspaceId]);if(!owned.rowCount)return res.status(404).json({error:"Conversation not found"});res.json((await query("SELECT id,sender,content,language,citations,handoff,created_at FROM messages WHERE conversation_id=$1 ORDER BY created_at",[req.params.id])).rows);});
+app.get("/api/conversations/:id/messages",auth,workspace,async(req,res)=>{const owned=await query("SELECT id FROM conversations WHERE id=$1 AND workspace_id=$2",[req.params.id,(req as any).workspaceId]);if(!owned.rowCount)return res.status(404).json({error:"Conversation not found"});res.json((await query("SELECT id,sender,content,language,citations,handoff,created_at FROM messages WHERE conversation_id=$1 ORDER BY created_at DESC LIMIT 500",[req.params.id])).rows.reverse());});
 app.post("/api/conversations/:id/reply",auth,workspace,requireRole("owner","admin","agent"),async(req,res,next)=>{try{const content=z.string().min(1).max(8000).parse(req.body.content);const own=await query("SELECT id FROM conversations WHERE id=$1 AND workspace_id=$2",[req.params.id,(req as any).workspaceId]);if(!own.rowCount)return res.status(404).json({error:"Conversation not found"});const m=(await query("INSERT INTO messages(conversation_id,sender,content) VALUES($1,'agent',$2) RETURNING *",[req.params.id,content])).rows[0];await query("UPDATE conversations SET status='open',updated_at=now() WHERE id=$1",[req.params.id]);res.status(201).json(m);}catch(e){next(e);}});
-app.patch("/api/conversations/:id",auth,workspace,async(req,res)=>{const status=z.enum(["open","escalated","closed"]).safeParse(req.body.status);if(!status.success)return res.status(400).json({error:"Invalid status"});const r=await query("UPDATE conversations SET status=$3,updated_at=now() WHERE id=$1 AND workspace_id=$2 RETURNING id,status",[req.params.id,(req as any).workspaceId,status.data]);if(!r.rowCount)return res.status(404).json({error:"Conversation not found"});res.json(r.rows[0]);});
+app.patch("/api/conversations/:id",auth,workspace,requireRole("owner","admin","agent"),async(req,res)=>{const status=z.enum(["open","escalated","closed"]).safeParse(req.body.status);if(!status.success)return res.status(400).json({error:"Invalid status"});const r=await query("UPDATE conversations SET status=$3,updated_at=now() WHERE id=$1 AND workspace_id=$2 RETURNING id,status",[req.params.id,(req as any).workspaceId,status.data]);if(!r.rowCount)return res.status(404).json({error:"Conversation not found"});res.json(r.rows[0]);});
 app.post("/api/feedback",auth,workspace,async(req,res,next)=>{try{const d=z.object({messageId:z.string().uuid(),helpful:z.boolean(),comment:z.string().max(1000).optional()}).parse(req.body);const r=await query("INSERT INTO feedback(workspace_id,message_id,helpful,comment) SELECT $1,m.id,$3,$4 FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE m.id=$2 AND m.sender='assistant' AND c.workspace_id=$1 ON CONFLICT(message_id) DO UPDATE SET helpful=excluded.helpful,comment=excluded.comment RETURNING *",[(req as any).workspaceId,d.messageId,d.helpful,d.comment]);if(!r.rowCount)return res.status(404).json({error:"Assistant message not found"});res.status(201).json(r.rows[0]);}catch(e){next(e);}});
 app.get("/api/feedback",auth,workspace,async(req,res)=>res.json((await query("SELECT f.id,f.message_id,f.helpful,f.comment,f.created_at,c.id conversation_id FROM feedback f JOIN messages m ON m.id=f.message_id JOIN conversations c ON c.id=m.conversation_id WHERE f.workspace_id=$1 ORDER BY f.created_at DESC LIMIT 200",[(req as any).workspaceId])).rows));
 
@@ -144,7 +154,7 @@ app.post("/api/widget/:key/conversations/:id/messages",async(req,res,next)=>{
    if(/^\s*(handoff|escalate)\b/i.test(clean)||!clean||!citations.length){handoff=true;}
    else answer=clean;
   }
-  if(handoff){answer=language==="hi"?"à¤®à¥à¤à¥‡ à¤‰à¤ªà¤²à¤¬à¥à¤§ à¤¸à¤¹à¤¾à¤¯à¤¤à¤¾ à¤œà¤¾à¤¨à¤•à¤¾à¤°à¥€ à¤®à¥‡à¤‚ à¤‡à¤¸à¤•à¤¾ à¤­à¤°à¥‹à¤¸à¥‡à¤®à¤‚à¤¦ à¤‰à¤¤à¥à¤¤à¤° à¤¨à¤¹à¥€à¤‚ à¤®à¤¿à¤²à¤¾à¥¤ à¤®à¥ˆà¤‚à¤¨à¥‡ à¤†à¤ªà¤•à¤¾ à¤¸à¤‚à¤¦à¥‡à¤¶ à¤¸à¤¹à¤¾à¤¯à¤¤à¤¾ à¤Ÿà¥€à¤® à¤•à¥‹ à¤­à¥‡à¤œ à¤¦à¤¿à¤¯à¤¾ à¤¹à¥ˆà¥¤":fallback;citations=[];}
+  if(handoff){answer=language==="hi"?"मुझे उपलब्ध सहायता जानकारी में इसका भरोसेमंद उत्तर नहीं मिला। मैंने आपका संदेश सहायता टीम को भेज दिया है।":fallback;citations=[];}
   const m=(await query("INSERT INTO messages(conversation_id,sender,content,language,citations,handoff) VALUES($1,'assistant',$2,$3,$4::jsonb,$5) RETURNING id,sender,content,language,citations,handoff,created_at",[req.params.id,answer,language,JSON.stringify(citations),handoff])).rows[0];
   await query("UPDATE conversations SET status=CASE WHEN $2 THEN 'escalated' ELSE status END,updated_at=now() WHERE id=$1",[req.params.id,handoff]);
   if(wantsStream){emit({type:"final",message:m});res.write("data: {\"type\":\"done\"}\n\n");res.end();}else res.status(201).json(m);
@@ -159,4 +169,6 @@ async function seed(){
  const email=process.env.DEMO_EMAIL;const password=process.env.DEMO_PASSWORD;
  if(email&&password){const existing=await query<any>("SELECT id FROM users WHERE email=lower($1)",[email]);if(!existing.rowCount){const u=(await query<any>("INSERT INTO users(name,email,password_hash) VALUES('Demo Admin',lower($1),$2) RETURNING id",[email,await bcrypt.hash(password,12)])).rows[0];const w=(await query<any>("INSERT INTO workspaces(name,allowed_domains) VALUES('Acme Demo Support',ARRAY['localhost']) RETURNING id",[])).rows[0];await query("INSERT INTO memberships(workspace_id,user_id,role) VALUES($1,$2,'owner')",[w.id,u.id]);const faq=(await query<any>("INSERT INTO sources(workspace_id,title,kind,status) VALUES($1,'Getting started','faq','ready') RETURNING id",[w.id])).rows[0];const text="Question: How do I reset my password? Answer: Select Forgot password on the sign-in screen, enter your account email, and follow the secure reset link sent to your inbox. The link expires after 30 minutes.\n\nQuestion: How can I contact support? Answer: Ask a question through this support chat. If the assistant cannot find a reliable answer, it will pass your conversation to a support agent.";const chunks=text.match(/.{1,900}/gs)??[text];const vectors=await embed(chunks);for(let i=0;i<chunks.length;i++)await query("INSERT INTO source_chunks(workspace_id,source_id,chunk_index,content,embedding) VALUES($1,$2,$3,$4,$5::vector)",[w.id,faq.id,i,chunks[i],`[${vectors[i].join(",")}]`]);}}
 }
-seed().then(()=>app.listen(port,()=>console.log(`API listening on http://localhost:${port}`))).catch(e=>{console.error("Startup failed",e);process.exit(1);});
+const server=seed().then(()=>app.listen(port,()=>console.log(`API listening on port ${port}`))).catch(e=>{console.error("Startup failed",e);process.exit(1);});
+process.on("SIGTERM",async()=>{(await server).close(async()=>{await pool.end();process.exit(0);});});
+process.on("SIGINT",async()=>{(await server).close(async()=>{await pool.end();process.exit(0);});});

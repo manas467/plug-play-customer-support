@@ -1,8 +1,10 @@
 ﻿import fs from "node:fs/promises";
 import path from "node:path";
 import { createRequire } from "node:module";
+import { lookup } from "node:dns/promises";
+import { isIP } from "node:net";
 import { load } from "cheerio";
-import { query } from "./db.js";
+import { query, pool } from "./db.js";
 const require = createRequire(import.meta.url);
 const pdfParse = require("pdf-parse");
 const uploadRoot = path.resolve(process.env.UPLOAD_DIR ?? "./data/uploads");
@@ -21,20 +23,28 @@ export async function extractFile(filePath: string, originalName: string): Promi
   if ([".txt", ".md", ".csv"].includes(ext)) return fs.readFile(filePath, "utf8");
   throw new Error("Supported files: PDF, DOCX, TXT, MD, CSV");
 }
-function assertSafeUrl(raw: string) {
+async function assertSafeUrl(raw: string) {
   const u = new URL(raw);
+  if(u.username||u.password)throw new Error("URL credentials are not allowed");
+  const host=u.hostname.toLowerCase().replace(/^\[|\]$/g,"");
+  const blocked=(ip:string)=>{if(ip.includes(":"))return ip==="::"||ip==="::1"||/^f[cd]/i.test(ip)||/^fe[89ab]/i.test(ip)||ip.startsWith("::ffff:");const [a,b]=ip.split(".").map(Number);return a===0||a===10||a===127||a>=224||(a===169&&b===254)||(a===172&&b>=16&&b<=31)||(a===192&&b===168);};
+  if(isIP(host)){if(blocked(host))throw new Error("Only public HTTP(S) URLs are allowed");}else{const ips=await lookup(host,{all:true,verbatim:true});if(!ips.length||ips.some(x=>blocked(x.address)))throw new Error("Only public HTTP(S) URLs are allowed");}
   if (!(["http:", "https:"].includes(u.protocol)) || ["localhost", "127.0.0.1", "::1"].includes(u.hostname) || /^10\.|^192\.168\.|^172\.(1[6-9]|2\d|3[01])\./.test(u.hostname)) throw new Error("Only public HTTP(S) URLs are allowed");
 }
 export async function readUrl(url: string) {
-  assertSafeUrl(url);
-  const response = await fetch(url, { signal: AbortSignal.timeout(12000), headers: { "User-Agent": "SupportPlatformBot/0.1" } });
+  await assertSafeUrl(url);
+  const response = await fetch(url, { redirect:"error", signal: AbortSignal.timeout(12000), headers: { "User-Agent": "SupportPlatformBot/0.1" } });
   if (!response.ok) throw new Error(`URL returned HTTP ${response.status}`);
-  const html = await response.text(); const $ = load(html);
+  if(Number(response.headers.get("content-length")??0)>5_000_000)throw new Error("URL content is too large");
+  const reader=response.body?.getReader();if(!reader)throw new Error("URL returned no content");const parts:Uint8Array[]=[];let total=0;
+  while(true){const {done,value}=await reader.read();if(done)break;total+=value.byteLength;if(total>5_000_000){await reader.cancel();throw new Error("URL content is too large");}parts.push(value);}
+  const html=Buffer.concat(parts).toString("utf8"); const $ = load(html);
   $("script, style, nav, footer, header, noscript, svg").remove();
   const title = $("title").first().text().trim() || url;
   return { title, text: $("main").text() || $("article").text() || $("body").text() };
 }
 export function chunkText(text: string, size = 900, overlap = 120): string[] {
+  if(text.length>2_000_000)throw new Error("Source content exceeds the 2 MB indexing limit");
   const normalized = text.replace(/\s+/g, " ").trim(); if (!normalized) return [];
   const chunks: string[] = []; let start = 0;
   while (start < normalized.length) {
@@ -53,11 +63,14 @@ export async function indexSource(sourceId: string, workspaceId: string, text: s
   await query("UPDATE sources SET status='processing', error=NULL, updated_at=now() WHERE id=$1 AND workspace_id=$2", [sourceId, workspaceId]);
   try {
     const chunks = chunkText(text); if (!chunks.length) throw new Error("No readable text found");
-    await query("DELETE FROM source_chunks WHERE source_id=$1 AND workspace_id=$2", [sourceId, workspaceId]);
+    const vectors: number[][] = [];
     for (let i = 0; i < chunks.length; i += 12) {
-      const batch = chunks.slice(i, i + 12); const vectors = await embed(batch);
-      for (let j = 0; j < batch.length; j++) await query("INSERT INTO source_chunks(workspace_id,source_id,chunk_index,content,embedding) VALUES($1,$2,$3,$4,$5::vector)", [workspaceId, sourceId, i + j, batch[j], `[${vectors[j].join(",")}]`]);
+      vectors.push(...await embed(chunks.slice(i, i + 12)));
     }
-    await query("UPDATE sources SET status='ready',updated_at=now() WHERE id=$1 AND workspace_id=$2", [sourceId,workspaceId]);
+    const client=await pool.connect();
+    try{await client.query("BEGIN");await client.query("DELETE FROM source_chunks WHERE source_id=$1 AND workspace_id=$2",[sourceId,workspaceId]);
+      for(let i=0;i<chunks.length;i++)await client.query("INSERT INTO source_chunks(workspace_id,source_id,chunk_index,content,embedding) VALUES($1,$2,$3,$4,$5::vector)",[workspaceId,sourceId,i,chunks[i],`[${vectors[i].join(",")}]`]);
+      await client.query("UPDATE sources SET status='ready',error=NULL,updated_at=now() WHERE id=$1 AND workspace_id=$2",[sourceId,workspaceId]);await client.query("COMMIT");
+    }catch(e){await client.query("ROLLBACK");throw e;}finally{client.release();}
   } catch (e) { await query("UPDATE sources SET status='error',error=$3,updated_at=now() WHERE id=$1 AND workspace_id=$2", [sourceId,workspaceId,String(e).slice(0,500)]); throw e; }
 }
