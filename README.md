@@ -18,6 +18,8 @@ The app works without a GPU. On an 8 GB machine, small quantized Ollama models m
 
 The app does not require a fine-tuned adapter. `python evaluate.py` runs the small held-out generation benchmark and reports expected-content, citation/abstention, script, and handoff rates. It requires a running ML service and Ollama. Treat this as a smoke benchmark, then add representative, reviewed cases and labeled relevant passages before changing retrieval thresholds or the vector/text blend. Never put tenant-uploaded/private content in evaluation or training data.
 
+Run `python evaluate_retrieval.py` from `services/ml` to compare vector weights on the synthetic English/Hindi labeled retrieval set. It reports Recall@K, MRR, and nDCG@K. This offline benchmark uses token overlap as a lightweight lexical proxy; production combines pgvector similarity with PostgreSQL `ts_rank`, so validate promising weights against a labeled staging corpus before deployment. Never include private tenant data.
+
 ## Security notes
 
 Workspace-scoped authorization is enforced in API queries. The ML service limits concurrent work and request sizes; `ML_API_KEY` enables API-to-ML authentication. Keep ML and Ollama on private networks, configure HTTPS, durable object storage, backups, and production identity controls before exposing this development MVP publicly. The widget domain allowlist is a browser embedding restriction, not visitor authentication.
